@@ -1,0 +1,40 @@
+%% Storage layers figure for finding-space.Rmd. Render from ora/vignettes:
+%% pnpm dlx @mermaid-js/mermaid-cli -i layers.mmd -o layers.svg \
+%%   -c layers-config.json -b white
+%% Without a puppeteer browser add: -p <file with {"executablePath": ...}>
+flowchart TB
+  DF[("Data files<br/>users01.dbf, users02.dbf")]
+  subgraph TS["Tablespace USERS"]
+    direction LR
+    subgraph S4["Segment: LOB of DOCUMENTS.BODY"]
+      E4["Extent"]
+    end
+    subgraph S3["Segment: IOT top index MEASUREMENTS_PK"]
+      E3["Extent"]
+    end
+    subgraph S2["Segment: index SALES_CUSTOMER_IX"]
+      E2["Extent"]
+    end
+    subgraph S1["Segment: table SALES, partition P2024_01"]
+      subgraph X1["Extent 8 MB"]
+        direction LR
+        B1["Block<br/>8 KB"]
+        B2["Block<br/>8 KB"]
+        B3["..."]
+        B1 ~~~ B2 ~~~ B3
+      end
+    end
+  end
+  DF --- TS
+
+  classDef node fill:#cde2fb,stroke:#2a78d6,color:#0b0b0b
+  classDef dots fill:#ffffff,stroke:#ffffff,color:#52514e
+  class E2,E3,E4,B1,B2 node
+  class B3 dots
+  style TS fill:#fcfcfb,stroke:#898781,color:#0b0b0b
+  style S1 fill:#ffffff,stroke:#c3c2b7,color:#0b0b0b
+  style S2 fill:#ffffff,stroke:#c3c2b7,color:#0b0b0b
+  style S3 fill:#ffffff,stroke:#c3c2b7,color:#0b0b0b
+  style S4 fill:#ffffff,stroke:#c3c2b7,color:#0b0b0b
+  style X1 fill:#f4f8fd,stroke:#86b6ef,color:#0b0b0b
+  style DF fill:#cde2fb,stroke:#2a78d6,color:#0b0b0b

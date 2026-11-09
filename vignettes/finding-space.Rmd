@@ -1,0 +1,670 @@
+---
+title: "Finding where the space goes"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Finding where the space goes}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = ora::ora_has_example_db()
+)
+```
+
+This vignette helps you to answer the following questions,
+ - how full is the database,
+ - which schema uses the space,
+ - which segments are biggest,
+ - how the IOTs and partitions look and
+ - which cleanup SQL to run.
+Everything except the last step is read-only.
+
+## Introduction
+
+Oracle stores data in layers: data files make up a tablespace, which holds
+segments, made of extents, made of blocks that hold the rows.
+
+![Storage layers: a tablespace holds one segment per table, index, LOB or
+partition.](layers.svg){width=100%}
+
+- **Schema (owner)**: the objects (tables, indexes, LOBs, views, ...) that
+  belong to one database user. Every user has exactly one schema with the
+  same name, so `SPACEAPP.SALES` is table `SALES` in schema `SPACEAPP`.
+  "Schema" names the collection, "owner" names the user it belongs to: the
+  data dictionary views have an `OWNER` column whose value is the schema
+  name, and the `owner` argument of the functions selects one schema. The
+  user you connect as can differ from the schema you examine.
+- **Segment**: the space reserved for one object that stores data. Space is
+  counted in segments (`DBA_SEGMENTS`), so almost every size here is a sum
+  of segments. Views and procedures have none, and an empty new table gets
+  its segment only with the first row.
+- **Allocated is not used**: a segment's size is what Oracle has reserved,
+  not how much data it holds. `DELETE` frees no space, the segment keeps
+  its size. Only `SHRINK SPACE`, `MOVE` or `DROP` make it smaller, and a
+  new segment starts with at least one extent, often 8 MB even for one row.
+- **Tablespace**: a named storage area made of data files. Segments live in
+  tablespaces, and a tablespace is full when its files cannot grow further.
+- **Partition**: a piece of a large table or index, usually one per month.
+  A partitioned table has no segment itself, each partition is its own
+  segment and can be dropped on its own. Dropping removes the segment
+  completely, which is why it saves the most space.
+- **IOT** (index-organized table): a table stored as its primary key index.
+  It has no table segment, its data lives in the `IOT - TOP` index segment.
+- **LOB** (large object): a `CLOB` (large text) or `BLOB` (binary data such
+  as files or images) column. Large values are stored outside the row in a
+  separate LOB segment, so a table can look small while its LOBs are large.
+- **FRA** (fast recovery area): disk space for archived redo logs and
+  backups. Moving or shrinking segments writes redo, which can fill it.
+- **Statistics**: row counts and average row length collected by Oracle.
+  Size estimates use them, so locked or stale statistics give wrong
+  estimates.
+
+
+## Function overview
+
+The analysis functions take a DBI connection `con` as first argument and
+mostly return a `data.frame`. Sizes come in `unit = "GB"` by default, and
+`include_oracle = FALSE` leaves out Oracle's own schemas such as `SYS`.
+All functions only read, except `ora_run_sql()`.
+
+```{css, echo = FALSE}
+.overview li {
+  margin-bottom: 12px
+}
+```
+
+::: {.overview}
+
+### Connection and privileges
+
+- `ora_version(con)`
+- `ora_whoami(con)`
+- `ora_can_read(con, views)`
+- `ora_who_has_privilege(con, privilege, include_oracle = FALSE)`
+- `ora_who_has_role(con, roles, include_oracle = FALSE)`
+- `ora_user_exists(con, username)`
+- `ora_object_owner(con, object_name)`
+- `ora_schema_sessions(con, owner)`
+- `ora_database_vault_enabled(con)`
+
+### Space overview
+
+- `ora_db_fullness(con, unit = "GB")`
+- `ora_tablespace_usage(con, unit = "GB")`
+- `ora_temp_usage(con, unit = "GB")`
+- `ora_fra_usage(con, unit = "GB")`
+
+### Schemas and segments
+
+- `ora_schema_sizes(con, unit = "GB", include_oracle = FALSE)`
+- `ora_schema_breakdown(con, owner, unit = "GB")`
+- `ora_top_segments(con, owner = NULL, n = 20L, unit = "GB", include_oracle = FALSE)`
+- `ora_table_sizes(con, owner, unit = "GB")`
+- `ora_index_sizes(con, owner, unit = "GB")`
+- `ora_lob_sizes(con, owner, unit = "GB")`
+- `ora_recyclebin_size(con, owner = NULL, unit = "GB", include_oracle = FALSE)`
+
+### IOTs and partitions
+
+- `ora_iot_tables(con, owner, unit = "GB")`
+- `ora_partition_sizes(con, owner, segment_name, n = NULL, unit = "GB")`
+- `ora_partition_summary(con, owner, segment_name, unit = "GB")`
+- `ora_partition_bounds(con, owner, table, unit = "GB")`
+- `ora_partition_estimates(con, owner, table, unit = "GB")`
+- `ora_estimate_data_size(con, owner, table, unit = "GB")`
+- `ora_count_rows(con, owner, table, partition = NULL)`
+
+### Activity and cleanup candidates
+
+- `ora_instance_uptime(con)`
+- `ora_untouched_tables(con, owner, unit = "GB")`
+- `ora_unused_indexes(con, owner, unit = "GB")`
+- `ora_unusable_indexes(con, owner)`
+- `ora_table_modifications(con, owner, table = NULL)`
+- `ora_table_locks(con, owner, table = NULL)`
+
+### Maintenance SQL
+
+The `ora_sql_*()` functions only **return SQL code**, they never execute it.
+Inspect the SQL, then run it yourself with `ora_run_sql()`.
+
+- `ora_sql_rebuild_index(con, owner, index, partitions = NULL)`
+- `ora_sql_shrink_partitions(con, owner, table, partitions = NULL, compact = FALSE)`
+- `ora_sql_drop_partitions(con, owner, table, partitions)`
+- `ora_run_sql(con, sql, confirm = FALSE, check_fra = TRUE, unit = "GB")`
+
+### Plots and report
+
+- `ora_plot_tablespaces(x, n = 20L, main = "Tablespace usage")`
+- `ora_plot_schemas(x, n = 15L, main = "Largest schemas")`
+- `ora_plot_table_sizes(x, n = 15L, main = "Largest tables")`
+- `ora_plot_partitions(x, main = "Size per partition")`
+- `ora_space_report(con, owner = NULL, tables = NULL, file = "ora-space-report.html", unit = "GB", show_privileges = TRUE, show_fullness = TRUE, show_schemas = TRUE, show_segments = TRUE, show_iot = TRUE, show_partitions = TRUE, show_activity = FALSE, show_cleanup = FALSE, open = interactive())`
+
+:::
+
+## Function usage
+
+One example per function, run against the test database from
+`inst/test-setup/`. All examples share one connection and the test schema
+`SPACEAPP`.
+
+```{r usage-connect}
+library(ora)
+con <- DBI::dbConnect(
+  odbc::odbc(),
+  dsn = Sys.getenv("ORA_DSN"),
+  uid = Sys.getenv("ORA_USER"),
+  pwd = Sys.getenv("ORA_PASSWORD")
+)
+owner <- "SPACEAPP"
+```
+
+### Connection and privileges
+
+#### `ora_version(con)`
+
+Returns the database version and edition.
+
+```{r usage-01}
+ora_version(con)
+```
+
+#### `ora_whoami(con)`
+
+Returns the current user, session roles and session privileges as a list.
+
+```{r usage-02}
+ora_whoami(con)
+```
+
+#### `ora_can_read(con, views)`
+
+Tests for each view whether the current user can read it.
+
+```{r usage-03}
+ora_can_read(con, c("DBA_SEGMENTS", "DBA_USERS", "V$SESSION"))
+```
+
+#### `ora_who_has_privilege(con, privilege, include_oracle)`
+
+Lists the users and roles holding a system privilege, also through nested
+roles.
+
+```{r usage-04}
+# all users and roles holding CREATE SESSION, here only the users
+priv <- ora_who_has_privilege(con, "CREATE SESSION")
+priv[priv$grantee_type == "USER", ]
+```
+
+#### `ora_who_has_role(con, roles, include_oracle)`
+
+Lists the users and roles holding a role, also through nested roles.
+
+```{r usage-05}
+role <- ora_who_has_role(con, "SELECT_CATALOG_ROLE")
+role[role$grantee_type == "USER", ]
+```
+
+#### `ora_user_exists(con, username)`
+
+Tests whether users exist.
+
+```{r usage-06}
+ora_user_exists(con, c("SPACEAPP", "NO_SUCH_USER"))
+```
+
+#### `ora_object_owner(con, object_name)`
+
+Lists the schemas that own an object of this name.
+
+```{r usage-07}
+ora_object_owner(con, "SALES")
+```
+
+#### `ora_schema_sessions(con, owner)`
+
+Lists the sessions of a schema.
+
+```{r usage-08}
+ora_schema_sessions(con, owner)
+```
+
+#### `ora_database_vault_enabled(con)`
+
+Tests whether Oracle Database Vault is enabled.
+
+```{r usage-09}
+ora_database_vault_enabled(con)
+```
+
+### Space overview
+
+#### `ora_db_fullness(con, unit)`
+
+Returns used, allocated and maximum size of the whole database.
+
+```{r usage-10}
+ora_db_fullness(con)
+```
+
+#### `ora_tablespace_usage(con, unit)`
+
+Returns used, allocated and maximum size per tablespace, fullest first.
+
+```{r usage-11}
+ora_tablespace_usage(con, unit = "MB")
+```
+
+#### `ora_temp_usage(con, unit)`
+
+Returns the usage of the temporary tablespaces.
+
+```{r usage-12}
+ora_temp_usage(con, unit = "MB")
+```
+
+#### `ora_fra_usage(con, unit)`
+
+Returns the usage of the fast recovery area.
+
+```{r usage-13}
+ora_fra_usage(con)
+```
+
+### Schemas and segments
+
+#### `ora_schema_sizes(con, unit, include_oracle)`
+
+Returns the size per schema, largest first.
+
+```{r usage-14}
+ora_schema_sizes(con, unit = "MB")
+```
+
+#### `ora_schema_breakdown(con, owner, unit)`
+
+Returns the size per segment type of one schema.
+
+```{r usage-15}
+ora_schema_breakdown(con, owner, unit = "MB")
+```
+
+#### `ora_top_segments(con, owner, n, unit, include_oracle)`
+
+Returns the largest segments of all schemas or of one.
+
+```{r usage-16}
+ora_top_segments(con, owner, n = 5, unit = "MB")
+```
+
+#### `ora_table_sizes(con, owner, unit)`
+
+Returns the size per table, split into data, indexes and LOBs.
+
+```{r usage-17}
+ora_table_sizes(con, owner, unit = "MB")
+```
+
+#### `ora_index_sizes(con, owner, unit)`
+
+Returns the size per index.
+
+```{r usage-18}
+ora_index_sizes(con, owner, unit = "MB")
+```
+
+#### `ora_lob_sizes(con, owner, unit)`
+
+Returns the size per LOB column.
+
+```{r usage-19}
+ora_lob_sizes(con, owner, unit = "MB")
+```
+
+#### `ora_recyclebin_size(con, owner, unit, include_oracle)`
+
+Returns the size of dropped tables in the recycle bin per schema.
+
+```{r usage-20}
+ora_recyclebin_size(con, owner, unit = "MB")
+```
+
+### IOTs and partitions
+
+#### `ora_iot_tables(con, owner, unit)`
+
+Lists the index-organized tables with their size.
+
+```{r usage-21}
+ora_iot_tables(con, owner, unit = "MB")
+```
+
+#### `ora_partition_sizes(con, owner, segment_name, n, unit)`
+
+Returns the size per partition, largest first.
+
+```{r usage-22}
+ora_partition_sizes(con, owner, "MEASUREMENTS", n = 5, unit = "MB")
+```
+
+#### `ora_partition_summary(con, owner, segment_name, unit)`
+
+Returns the partition count, first and last partition name and total size.
+
+```{r usage-23}
+ora_partition_summary(con, owner, "MEASUREMENTS", unit = "MB")
+```
+
+#### `ora_partition_bounds(con, owner, table, unit)`
+
+Returns the date range and size per partition, to pick old partitions by date.
+
+```{r usage-24}
+bounds <- ora_partition_bounds(con, owner, "SALES", unit = "MB")
+head(bounds[, c("partition_name", "low_date", "high_date", "size_mb")])
+```
+
+#### `ora_partition_estimates(con, owner, table, unit)`
+
+Compares the estimated with the actual size per partition, including the space
+a shrink could free.
+
+```{r usage-25}
+est <- ora_partition_estimates(con, owner, "MEASUREMENTS", unit = "KB")
+head(est[, c("partition_name", "num_rows", "estimated_kb", "segment_kb",
+  "reclaimable_kb", "reliable")])
+```
+
+#### `ora_estimate_data_size(con, owner, table, unit)`
+
+Estimates the data size of a table from its statistics.
+
+```{r usage-26}
+ora_estimate_data_size(con, owner, "SALES", unit = "MB")
+```
+
+#### `ora_count_rows(con, owner, table, partition)`
+
+Counts the rows of a table or partition exactly, which is slow on large
+tables.
+
+```{r usage-27}
+ora_count_rows(con, owner, "SALES")
+```
+
+### Activity and cleanup candidates
+
+#### `ora_instance_uptime(con)`
+
+Returns the instance startup time and uptime.
+
+```{r usage-28}
+ora_instance_uptime(con)
+```
+
+#### `ora_untouched_tables(con, owner, unit)`
+
+Lists tables without reads since instance startup.
+
+```{r usage-29}
+ora_untouched_tables(con, owner, unit = "MB")
+```
+
+#### `ora_unused_indexes(con, owner, unit)`
+
+Lists indexes never used according to index usage tracking.
+
+```{r usage-30}
+ora_unused_indexes(con, owner, unit = "MB")
+```
+
+#### `ora_unusable_indexes(con, owner)`
+
+Lists indexes and index partitions left unusable, e.g. after maintenance.
+
+```{r usage-31}
+ora_unusable_indexes(con, owner)
+```
+
+#### `ora_table_modifications(con, owner, table)`
+
+Returns inserts, updates and deletes since the last statistics.
+
+```{r usage-32}
+ora_table_modifications(con, owner, "SALES")
+```
+
+#### `ora_table_locks(con, owner, table)`
+
+Lists sessions holding locks on tables.
+
+```{r usage-33}
+ora_table_locks(con, owner, "SALES")
+```
+
+### Maintenance SQL
+
+The `ora_sql_*()` functions only **return SQL code**, they never execute it.
+Inspect the SQL, then run it yourself with
+`ora_run_sql(con, sql, confirm = TRUE)`. The printed SQL starts with a
+comment saying it was not executed.
+
+#### `ora_sql_rebuild_index(con, owner, index, partitions)`
+
+Returns SQL to rebuild an index, using `MOVE` for IOT top indexes.
+Nothing is executed.
+
+```{r usage-34}
+ora_sql_rebuild_index(con, owner, "MEASUREMENTS_PK", "P2023_01")
+```
+
+#### `ora_sql_shrink_partitions(con, owner, table, partitions, compact)`
+
+Returns SQL to shrink table partitions. Nothing is executed.
+
+```{r usage-35}
+ora_sql_shrink_partitions(con, owner, "MEASUREMENTS", c("P2023_01", "P2023_02"))
+```
+
+#### `ora_sql_drop_partitions(con, owner, table, partitions)`
+
+Returns SQL to drop the partitions you name. Nothing is executed.
+
+```{r usage-36}
+ora_sql_drop_partitions(con, owner, "SALES", "P_START")
+```
+
+#### `ora_run_sql(con, sql, confirm, check_fra, unit)`
+
+**Runs** SQL statement by statement, only with `confirm = TRUE`.
+
+```{r usage-37, error = TRUE}
+sql <- ora_sql_shrink_partitions(con, owner, "MEASUREMENTS", "P2023_01")
+# without confirm = TRUE nothing is run
+ora_run_sql(con, sql)
+```
+
+### Plots and report
+
+#### `ora_plot_tablespaces(x, n, main)`
+
+Plots used versus maximum size per tablespace from `ora_tablespace_usage()`.
+
+```{r usage-38, fig.width = 7, fig.height = 3}
+ora_plot_tablespaces(ora_tablespace_usage(con, unit = "MB"))
+```
+
+#### `ora_plot_schemas(x, n, main)`
+
+Plots the largest schemas from `ora_schema_sizes()`.
+
+```{r usage-39, fig.width = 7, fig.height = 2.5}
+ora_plot_schemas(ora_schema_sizes(con, unit = "MB"))
+```
+
+#### `ora_plot_table_sizes(x, n, main)`
+
+Plots the largest tables split into data, indexes and LOBs from
+`ora_table_sizes()`.
+
+```{r usage-40, fig.width = 7, fig.height = 3}
+ora_plot_table_sizes(ora_table_sizes(con, owner, unit = "MB"))
+```
+
+#### `ora_plot_partitions(x, main)`
+
+Plots the size per partition in partition order from `ora_partition_sizes()`
+or `ora_partition_bounds()`.
+
+```{r usage-41, fig.width = 7, fig.height = 3.5}
+ora_plot_partitions(ora_partition_bounds(con, owner, "SALES", unit = "MB"))
+```
+
+#### `ora_space_report(con, owner, tables, file, unit, show_..., open)`
+
+Writes one HTML report with the sections switched on.
+
+```{r usage-42}
+file <- tempfile(fileext = ".html")
+ora_space_report(con, owner, tables = "MEASUREMENTS", file = file,
+  open = FALSE)
+file.exists(file)
+```
+
+```{r usage-disconnect, include = FALSE}
+DBI::dbDisconnect(con)
+```
+
+## Example usage
+
+### Create a connection
+
+The code assumes that `ORA_DSN`, `ORA_USER` and `ORA_PASSWORD` are set
+as environment variable.
+
+```{r connect}
+library(ora)
+con <- DBI::dbConnect(
+  odbc::odbc(),
+  dsn = Sys.getenv("ORA_DSN"),
+  uid = Sys.getenv("ORA_USER"),
+  pwd = Sys.getenv("ORA_PASSWORD")
+)
+```
+
+### 1. What can I see?
+
+With limited privileges, check first which views are readable. Functions
+fall back to `ALL_*` views where possible and then report partial results.
+
+```{r privileges}
+ora_version(con)
+ora_can_read(
+  con,
+  c("DBA_SEGMENTS", "DBA_USERS", "DBA_INDEXES", "V$SESSION")
+)
+```
+
+### 2. How full is the database?
+
+`max` is the size the data files can grow to with autoextend.
+
+```{r fullness, fig.width = 7, fig.height = 3.5}
+ora_db_fullness(con)
+ts <- ora_tablespace_usage(con)
+ts
+ora_plot_tablespaces(ts)
+```
+
+### 3. Which schema uses the space?
+
+```{r schemas, fig.width = 7, fig.height = 3}
+owner <- "SPACEAPP"
+ora_plot_schemas(ora_schema_sizes(con, unit = "MB"))
+ora_schema_breakdown(con, owner)
+```
+
+### 4. Biggest segments, tables and indexes
+
+`ora_table_sizes()` adds indexes and LOBs to each table. IOT data lives in
+the `IOT - TOP` index and is counted as data. LOB columns are listed
+separately by `ora_lob_sizes()`: their size does not show in the table
+segment.
+
+```{r segments, fig.width = 7, fig.height = 3}
+ora_top_segments(con, n = 5, unit = "MB")
+tabs <- ora_table_sizes(con, owner, unit = "MB")
+ora_plot_table_sizes(tabs)
+head(ora_index_sizes(con, owner, unit = "MB"))
+ora_lob_sizes(con, owner, unit = "MB")
+ora_recyclebin_size(con, owner, unit = "MB")
+```
+
+### 5. IOT check
+
+`ALTER INDEX ... REBUILD` fails on `IOT - TOP` indexes, so it matters which
+tables are IOTs.
+
+```{r iot}
+ora_iot_tables(con, owner, unit = "MB")
+```
+
+### 6. Partitions
+
+For an IOT, pass the table name. Statistics may be locked or stale, so
+check `reliable` before trusting an estimate.
+
+```{r partitions, fig.width = 7, fig.height = 3.5}
+ora_partition_summary(con, owner, "MEASUREMENTS", unit = "MB")
+ora_estimate_data_size(con, owner, "SALES", unit = "MB")
+ora_plot_partitions(ora_partition_sizes(con, owner, "MEASUREMENTS", unit = "MB"))
+```
+
+`ora_partition_estimates()` compares statistics with the real size per
+partition. Large `waste` hints where shrink or move pays off.
+
+```{r estimates}
+est <- ora_partition_estimates(con, owner, "MEASUREMENTS", unit = "MB")
+head(est[order(-est$waste_mb), c("partition_name", "num_rows",
+  "estimated_mb", "segment_mb", "waste_mb", "reliable")])
+```
+
+To drop old partitions, pick them by date with `ora_partition_bounds()`.
+
+```{r bounds, fig.width = 7, fig.height = 3.5}
+bounds <- ora_partition_bounds(con, owner, "SALES", unit = "MB")
+old <- bounds$partition_name[!is.na(bounds$high_date) &
+  bounds$high_date <= as.Date("2021-01-01")]
+old
+ora_plot_partitions(bounds)
+```
+
+### 7. Cleanup SQL
+
+The `ora_sql_*()` functions only generate SQL. Review it, then run it with
+`ora_run_sql(con, sql, confirm = TRUE)`, which checks the fast recovery area
+first, logs size before and after and stops on the first error.
+
+Check first that no session locks the table, then generate the SQL.
+
+```{r cleanup}
+ora_table_locks(con, owner, "SALES")
+ora_sql_shrink_partitions(con, owner, "MEASUREMENTS", "P2023_01")
+ora_sql_rebuild_index(con, owner, "MEASUREMENTS_PK", "P2023_01")
+ora_sql_drop_partitions(con, owner, "SALES", head(old, 3))
+```
+
+After running the SQL, check for indexes left unusable.
+
+```{r unusable}
+ora_unusable_indexes(con, owner)
+```
+
+```{r disconnect, include = FALSE}
+DBI::dbDisconnect(con)
+```

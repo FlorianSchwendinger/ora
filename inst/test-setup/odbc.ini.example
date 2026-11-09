@@ -1,0 +1,4 @@
+# Append to ~/.odbc.ini. Then set ORA_TEST_DSN=ora-test.
+[ora-test]
+Driver = Oracle 21 ODBC driver
+ServerName = //localhost:1521/XEPDB1

@@ -1,0 +1,367 @@
+---
+title: "Oracle space report"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  html_document:
+    toc: true
+    self_contained: true
+    mathjax: null
+params:
+  con: NULL
+  owner: NULL
+  tables: NULL
+  unit: "GB"
+  show_privileges: true
+  show_fullness: true
+  show_schemas: true
+  show_segments: true
+  show_iot: true
+  show_partitions: true
+  show_activity: false
+  show_cleanup: false
+---
+
+```{css ora-report-css, echo = FALSE}
+h2 {
+  border-top: 1px solid #c3c2b7
+}
+h2 {
+  padding-top: 24px
+}
+h2 {
+  margin-top: 40px
+}
+```
+
+```{r ora-report-setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 4
+)
+con <- params$con
+unit <- params$unit
+owners <- params$owner
+tables <- params$tables
+if (is.null(tables)) {
+  tables <- data.frame(owner = character(0), table_name = character(0))
+}
+
+# Escape $ so pandoc does not read V$VIEW names as math.
+esc <- function(x) {
+  gsub("$", "\\$", x, fixed = TRUE)
+}
+
+# Run one query: errors become a "Skipped" note, ALL_* fallbacks a
+# "Partial" note. Returns NULL when skipped.
+run <- function(expr) {
+  partial <- FALSE
+  res <- tryCatch(
+    withCallingHandlers(
+      expr,
+      ora_partial = function(m) {
+        partial <<- TRUE
+        invokeRestart("muffleMessage")
+      }
+    ),
+    error = function(e) e
+  )
+  if (inherits(res, "error")) {
+    cat("\n> Skipped: ", esc(conditionMessage(res)), "\n\n", sep = "")
+    return(NULL)
+  }
+  if (partial) {
+    cat(
+      "\n> Partial result: some DBA_* views are not readable,",
+      "ALL_* views were used.\n\n"
+    )
+  }
+  res
+}
+
+# Print a data.frame as a table, at most n rows.
+tab <- function(x, n = 20L, caption = NULL) {
+  if (is.null(x)) {
+    return(invisible(NULL))
+  }
+  if (nrow(x) == 0L) {
+    if (!is.null(caption)) {
+      cat("\n", esc(caption), ": no rows.\n\n", sep = "")
+    } else {
+      cat("\nNo rows.\n\n")
+    }
+    return(invisible(NULL))
+  }
+  for (col in names(x)) {
+    if (is.character(x[[col]])) {
+      x[[col]] <- esc(x[[col]])
+    }
+  }
+  if (!is.null(caption)) {
+    caption <- esc(caption)
+  }
+  print(knitr::kable(x[seq_len(min(n, nrow(x))), , drop = FALSE],
+    row.names = FALSE, caption = caption))
+  if (nrow(x) > n) {
+    cat(sprintf("\n%d of %d rows shown.\n", n, nrow(x)))
+  }
+  cat("\n\n")
+  invisible(NULL)
+}
+
+# Print a markdown heading on its own lines, also right after a plot.
+heading <- function(level, text) {
+  cat("\n\n", strrep("#", level), " ", text, "\n\n", sep = "")
+}
+
+# Turn the one-row fullness result into measure / value / meaning rows.
+fullness_rows <- function(x) {
+  unit_label <- if (unit == "B") "bytes" else unit
+  suffix <- if (unit == "B") "bytes" else tolower(unit)
+  meaning <- c(
+    used = "space the segments occupy",
+    allocated = "current size of the data files on disk",
+    max = "size the data files can grow to with autoextend",
+    free = "max minus used, room left before the database is full"
+  )
+  sizes <- vapply(names(meaning), function(m) {
+    v <- x[[paste(m, suffix, sep = "_")]]
+    paste(formatC(v, format = "f", digits = if (unit == "B") 0L else 2L,
+      big.mark = ","), unit_label)
+  }, character(1L))
+  data.frame(
+    measure = c(names(meaning), "used_pct"),
+    value = c(unname(sizes), sprintf("%.2f %%", x$used_pct)),
+    meaning = c(unname(meaning), "used as a share of max")
+  )
+}
+
+has_rows <- function(x) {
+  !is.null(x) && nrow(x) > 0L
+}
+
+need_owner <- function() {
+  if (length(owners) == 0L) {
+    cat("\nSet `owner` to show this section.\n\n")
+    return(FALSE)
+  }
+  TRUE
+}
+
+sql_block <- function(sql) {
+  cat("\n```sql\n")
+  cat(as.character(sql), sep = "\n")
+  cat("```\n\n")
+}
+```
+
+```{r ora-report-header, results = "asis"}
+v <- run(ora::ora_version(con))
+if (has_rows(v)) {
+  cat(sprintf("Database: %s, version %s.\n\n", v$product, v$version_full))
+}
+me <- run(ora::ora_whoami(con))
+if (!is.null(me)) {
+  cat(sprintf("Connected as %s (container %s).\n\n", me$username,
+    me$container))
+}
+cat(sprintf("Sizes in %s.", unit))
+if (length(owners) > 0L) {
+  cat(sprintf(" Schemas in detail: %s.", paste(owners, collapse = ", ")))
+}
+cat("\n\n")
+```
+
+```{r ora-report-privileges, eval = params$show_privileges, results = "asis"}
+heading(2, "Privileges")
+if (!is.null(me)) {
+  cat(sprintf("Session roles: %s.\n\n",
+    if (length(me$roles) > 0L) paste(me$roles, collapse = ", ") else "none"))
+}
+views <- c(
+  "DBA_SEGMENTS", "DBA_TABLESPACE_USAGE_METRICS", "DBA_DATA_FILES",
+  "DBA_USERS", "DBA_OBJECTS", "DBA_INDEXES", "DBA_LOBS", "DBA_INDEX_USAGE",
+  "V$INSTANCE", "V$SESSION", "V$SEGMENT_STATISTICS", "V$RECOVERY_FILE_DEST"
+)
+readable <- run(ora::ora_can_read(con, views))
+if (!is.null(readable)) {
+  tab(data.frame(view = names(readable), readable = unname(readable)))
+}
+```
+
+```{r ora-report-fullness, eval = params$show_fullness, results = "asis"}
+heading(2, "Database fullness")
+full <- run(ora::ora_db_fullness(con, unit))
+if (has_rows(full)) {
+  tab(fullness_rows(full),
+    caption = "Whole database, permanent and undo tablespaces without temp")
+}
+ts <- run(ora::ora_tablespace_usage(con, unit))
+tab(ts, caption = "Per tablespace, fullest first, without temp")
+if (has_rows(ts)) {
+  ora::ora_plot_tablespaces(ts)
+}
+heading(3, "Temporary tablespaces")
+tab(run(ora::ora_temp_usage(con, unit)), caption = "Temporary tablespaces")
+heading(3, "Fast recovery area")
+tab(run(ora::ora_fra_usage(con, unit)), caption = "Fast recovery area")
+```
+
+```{r ora-report-schemas, eval = params$show_schemas, results = "asis"}
+heading(2, "Schemas")
+sc <- run(ora::ora_schema_sizes(con, unit))
+tab(sc)
+if (has_rows(sc)) {
+  ora::ora_plot_schemas(sc)
+}
+for (o in owners) {
+  heading(3, sprintf("%s by segment type", o))
+  tab(run(ora::ora_schema_breakdown(con, o, unit)))
+}
+```
+
+```{r ora-report-segments, eval = params$show_segments, results = "asis"}
+heading(2, "Biggest segments")
+tab(run(ora::ora_top_segments(con, n = 20L, unit = unit)))
+for (o in owners) {
+  heading(3, sprintf("Tables of %s", o))
+  cat("Data, indexes and LOBs per table. IOT data counts as data.\n\n")
+  tb <- run(ora::ora_table_sizes(con, o, unit))
+  tab(tb)
+  if (has_rows(tb)) {
+    ora::ora_plot_table_sizes(tb)
+  }
+  heading(3, sprintf("Indexes of %s", o))
+  tab(run(ora::ora_index_sizes(con, o, unit)), n = 10L)
+  heading(3, sprintf("LOBs of %s", o))
+  tab(run(ora::ora_lob_sizes(con, o, unit)), n = 10L)
+  heading(3, sprintf("Recycle bin of %s", o))
+  tab(run(ora::ora_recyclebin_size(con, o, unit)))
+}
+```
+
+```{r ora-report-iot, eval = params$show_iot, results = "asis"}
+heading(2, "Index-organized tables")
+cat("`ALTER INDEX ... REBUILD` fails on IOT top indexes, use",
+  "`ALTER TABLE ... MOVE PARTITION` or `SHRINK SPACE`.\n\n")
+if (need_owner()) {
+  for (o in owners) {
+    heading(3, sprintf("%s", o))
+    tab(run(ora::ora_iot_tables(con, o, unit)))
+  }
+}
+```
+
+```{r ora-report-partitions, eval = params$show_partitions, results = "asis"}
+heading(2, "Partitions")
+if (nrow(tables) == 0L) {
+  cat("\nSet `tables` to show this section.\n\n")
+}
+for (i in seq_len(nrow(tables))) {
+  o <- tables$owner[i]
+  t <- tables$table_name[i]
+  heading(3, sprintf("%s.%s", o, t))
+  tab(run(ora::ora_partition_summary(con, o, t, unit)))
+  b <- run(ora::ora_partition_bounds(con, o, t, unit))
+  if (has_rows(b)) {
+    ora::ora_plot_partitions(b, main = sprintf("Size per partition of %s", t))
+    cat("\n\nOldest partitions:\n\n")
+    tab(b[, setdiff(names(b), "high_value")], n = 10L)
+  }
+  cat("Estimated versus actual size, most reclaimable first.",
+    "Shrink cannot go below the first extent (`initial`).\n\n")
+  est <- run(ora::ora_partition_estimates(con, o, t, unit))
+  if (has_rows(est)) {
+    rec_col <- grep("^reclaimable_", names(est), value = TRUE)[1L]
+    est <- est[!is.na(est[[rec_col]]), ]
+    if (nrow(est) == 0L) {
+      cat("\nNo partition statistics, waste cannot be estimated.\n\n")
+    } else {
+      if (!all(est$reliable)) {
+        cat("\n> Statistics are locked or stale for some partitions,",
+          "estimates may be wrong.\n\n")
+      }
+      keep <- c("partition_name", "num_rows",
+        grep("^(estimated|segment|initial|reclaimable)_(bytes|kb|mb|gb|tb)$",
+          names(est), value = TRUE),
+        "reliable")
+      tab(est[order(-est[[rec_col]]), keep], n = 10L)
+    }
+  }
+}
+```
+
+```{r ora-report-activity, eval = params$show_activity, results = "asis"}
+heading(2, "Activity")
+cat("Statistics count from instance startup.\n\n")
+tab(run(ora::ora_instance_uptime(con)))
+if (need_owner()) {
+  for (o in owners) {
+    heading(3, sprintf("Untouched tables of %s", o))
+    tab(run(ora::ora_untouched_tables(con, o, unit)))
+    heading(3, sprintf("Unused indexes of %s", o))
+    tab(run(ora::ora_unused_indexes(con, o, unit)))
+  }
+}
+```
+
+```{r ora-report-cleanup, eval = params$show_cleanup, results = "asis"}
+heading(2, "Cleanup SQL")
+cat("Generated only, nothing was run. Review it and run it with",
+  "`ora_run_sql(con, sql, confirm = TRUE)`.\n\n")
+if (need_owner()) {
+  for (o in owners) {
+    heading(3, sprintf("Unusable indexes of %s", o))
+    ui <- run(ora::ora_unusable_indexes(con, o))
+    tab(ui)
+    if (has_rows(ui)) {
+      for (ix in unique(ui$index_name)) {
+        parts <- ui$partition_name[ui$index_name == ix &
+          ui$object_level == "PARTITION"]
+        if (length(parts) == 0L) {
+          parts <- NULL
+        }
+        sql <- run(ora::ora_sql_rebuild_index(con, o, ix, parts))
+        if (!is.null(sql)) {
+          sql_block(sql)
+        }
+      }
+    }
+  }
+}
+for (i in seq_len(nrow(tables))) {
+  o <- tables$owner[i]
+  t <- tables$table_name[i]
+  heading(3, sprintf("Shrink %s.%s", o, t))
+  est <- run(ora::ora_partition_estimates(con, o, t, "B"))
+  if (has_rows(est)) {
+    stats <- est[!is.na(est$reclaimable_bytes), ]
+    gain <- stats[stats$reclaimable_bytes > 0, ]
+    if (nrow(stats) == 0L) {
+      cat("\nNo partition statistics, no shrink suggested.\n\n")
+    } else if (nrow(gain) == 0L) {
+      cat("\nAll partitions are at or near their minimum size, shrinking",
+        "frees nothing. Only dropping partitions frees space.\n\n")
+    } else {
+      if (!all(gain$reliable)) {
+        cat("\n> Statistics are locked or stale, check the estimates",
+          "before shrinking.\n\n")
+      }
+      gain <- gain[order(-gain$reclaimable_bytes), ]
+      top <- utils::head(gain, 3L)
+      cat(sprintf(
+        "\nThe %d partitions with the most reclaimable space, at most %s.\n\n",
+        nrow(top),
+        ora:::ora_fmt_size(ora:::ora_bytes_to_unit(
+          sum(top$reclaimable_bytes), unit), unit)
+      ))
+      sql <- run(ora::ora_sql_shrink_partitions(con, o, t, top$partition_name))
+      if (!is.null(sql)) {
+        sql_block(sql)
+      }
+    }
+  }
+}
+```

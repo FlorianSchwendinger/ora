@@ -1,0 +1,30 @@
+Package: ora
+Type: Package
+Title: Oracle Space and Privilege Helpers
+Version: 0.0.1
+Authors@R:
+    person("Florian", "Schwendinger",
+           email = "florian.schwendinger@quintik-tech.com",
+           role = c("aut", "cre"))
+Description: Read-only helpers to see how full an Oracle 19c database is,
+    where the space goes and which privileges the connecting user has.
+    Maintenance statements are only generated as SQL text.
+License: GPL-3
+Depends:
+    R (>= 4.0.0)
+Imports:
+    checkmate (>= 2.0.0),
+    DBI (>= 1.1.0),
+    glue (>= 1.6.0),
+    graphics,
+    stats,
+    utils
+Suggests:
+    knitr,
+    odbc,
+    rmarkdown,
+    tinytest
+VignetteBuilder: knitr
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+Config/roxygen2/version: 8.1.0

@@ -1,0 +1,5 @@
+# Append to /etc/odbcinst.ini (or ~/.odbcinst.ini). Adjust the path to
+# your Instant Client (basic + odbc packages).
+[Oracle 21 ODBC driver]
+Description = Oracle ODBC driver for Instant Client 21
+Driver = /opt/oracle/instantclient_21_15/libsqora.so.21.1

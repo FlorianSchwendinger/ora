@@ -1,0 +1,8 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^air\.toml$
+^tools$
+^README\.md$
+^vignettes/layers\.mmd$
+^vignettes/layers-config\.json$
+^\.vscode$
